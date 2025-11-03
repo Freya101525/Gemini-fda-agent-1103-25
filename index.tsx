@@ -2,9 +2,20 @@ import React, { useState, useEffect } from 'react';
 import { createRoot } from 'react-dom/client';
 import { GoogleGenAI } from "@google/genai";
 
+// Declare pdfjs and Tesseract on the window object for TypeScript
+declare global {
+    interface Window {
+        pdfjsLib: any;
+        Tesseract: any;
+    }
+}
+
+
 const App = () => {
     // --- STATE MANAGEMENT ---
     const [activeTab, setActiveTab] = useState('ingestion');
+    const [ocrStatus, setOcrStatus] = useState('');
+
 
     const REGULATORY_ORCHESTRATOR_PROMPT = `
 You are an expert regulatory reviewer for medical devices. Your job is to:
@@ -22,33 +33,34 @@ General rules:
 - No chain-of-thought. Provide only final reasoning succinctly as “rationale” fields when required.
 `;
 
+    // FIX: Renamed 'default_model' to 'model' and 'max_output_tokens' to 'maxOutputTokens' for consistency and to fix errors.
     const initialAgents = [
         {
           name: 'RequirementExtractor',
           description: 'Extracts structured requirements from the guidance.',
-          default_model: 'gemini-2.5-flash',
-          params: { temperature: 0.2, max_output_tokens: 2000 },
+          model: 'gemini-2.5-flash',
+          params: { temperature: 0.2, maxOutputTokens: 2000 },
           system_prompt: `${REGULATORY_ORCHESTRATOR_PROMPT}\nROLE: Requirement Extractor.\nTASK: Extract all explicit and implicit requirements from the provided guidance into a clean, deduplicated list with unique IDs.\nOUTPUT: JSON with fields: items[{id, title, requirement, category, references, priority}].\nSTYLE: concise, complete, bilingual labels if possible (Traditional Chinese and English).`
         },
         {
           name: 'GapAnalyzer',
           description: 'Compares provided dossier/evidence against extracted requirements to find gaps.',
-          default_model: 'gemini-2.5-pro',
-          params: { temperature: 0.2, max_output_tokens: 2000 },
+          model: 'gemini-2.5-pro',
+          params: { temperature: 0.2, maxOutputTokens: 2000 },
           system_prompt: `${REGULATORY_ORCHESTRATOR_PROMPT}\nROLE: Gap Analyzer.\nINPUTS: requirements JSON and dossier/evidence text.\nTASK: For each requirement, classify coverage (Covered/Partial/Missing), cite evidence snippets, and list missing evidence.\nOUTPUT: JSON with fields: coverage[{req_id, status, evidence_snippets[], missing_evidence[], risk_level, remediation_suggestions[]}].`
         },
         {
           name: 'EvidenceMapper',
           description: 'Maps documents/pages to requirements with traceability links.',
-          default_model: 'gemini-2.5-flash',
-          params: { temperature: 0.2, max_output_tokens: 1800 },
+          model: 'gemini-2.5-flash',
+          params: { temperature: 0.2, maxOutputTokens: 1800 },
           system_prompt: `${REGULATORY_ORCHESTRATOR_PROMPT}\nROLE: Evidence Mapper.\nTASK: Build a bidirectional traceability matrix between requirements and provided document sections/pages.\nOUTPUT: JSON with fields: trace[{req_id, doc_id, page, snippet, confidence}].`
         },
         {
           name: 'ChecklistFormatter',
           description: 'Produces a reviewer-ready checklist and summary.',
-          default_model: 'gemini-2.5-flash',
-          params: { temperature: 0.1, max_output_tokens: 2200 },
+          model: 'gemini-2.5-flash',
+          params: { temperature: 0.1, maxOutputTokens: 2200 },
           system_prompt: `${REGULATORY_ORCHESTRATOR_PROMPT}\nROLE: Checklist Formatter.\nTASK: Generate a final checklist table and executive summary (TC/EN bilingual section headers).\nOUTPUT: JSON {summary, checklist_markdown, key_risks[], next_actions[], glossary[]} and Markdown preview.`
         }
     ];
@@ -113,21 +125,24 @@ General rules:
             
             for (const agentConfig of workspace.agentsRunConfig) {
                 const startTime = performance.now();
+                
+                // FIX: Using the explicit chat history format for 'contents' by wrapping the user
+                // input in an array. This provides a more robust structure that the API expects,
+                // resolving the 'data' field initialization error, especially when chaining prompts.
                 const response = await ai.models.generateContent({
                     model: agentConfig.model,
-                    contents: [
-                        { role: "user", parts: [{ text: agentConfig.system_prompt + "\n\n" + currentInput }] }
-                    ],
+                    contents: [{ role: 'user', parts: [{ text: currentInput }] }],
                     config: {
+                        systemInstruction: agentConfig.system_prompt,
                         temperature: agentConfig.params.temperature,
-                        maxOutputTokens: agentConfig.params.max_output_tokens,
+                        maxOutputTokens: agentConfig.params.maxOutputTokens,
                     },
                 });
                 const endTime = performance.now();
                 const latency = (endTime - startTime) / 1000;
                 totalLatency += latency;
 
-                const outputText = response.text;
+                const outputText = response.text ?? ''; // Safely handle potentially empty responses
                 const logEntry = {
                     agentName: agentConfig.name,
                     model: agentConfig.model,
@@ -169,19 +184,86 @@ General rules:
         setWorkspace(p => ({...p, runLog: newRunLog}));
     };
 
-    const handleFileChange = (e) => {
+    const handleFileChange = async (e) => {
         const file = e.target.files[0];
-        if (file) {
+        if (!file) return;
+
+        if (file.type === 'application/pdf') {
+            await handlePdfUpload(file);
+        } else {
             const reader = new FileReader();
             reader.onload = (event) => {
                 const text = event.target.result as string;
                 setWorkspace(p => ({
                     ...p, 
                     rawText: text,
-                    metrics: { ...p.metrics, chars: text.length, ocr_pages: file.type === 'application/pdf' ? 'N/A' : 0 }
+                    metrics: { ...p.metrics, chars: text.length, ocr_pages: 0 }
                 }));
+                setActiveTab('agents'); 
             };
             reader.readAsText(file);
+        }
+    };
+
+    const handlePdfUpload = async (file) => {
+        setOcrStatus('Loading PDF...');
+        const fileReader = new FileReader();
+
+        fileReader.onload = async () => {
+            const typedarray = new Uint8Array(fileReader.result as ArrayBuffer);
+            const pdf = await window.pdfjsLib.getDocument(typedarray).promise;
+            let fullText = '';
+            
+            for (let i = 1; i <= pdf.numPages; i++) {
+                setOcrStatus(`Rendering page ${i}/${pdf.numPages}...`);
+                const page = await pdf.getPage(i);
+                const viewport = page.getViewport({ scale: 2.0 }); // Higher scale for better OCR
+                const canvas = document.createElement('canvas');
+                const context = canvas.getContext('2d');
+                canvas.height = viewport.height;
+                canvas.width = viewport.width;
+
+                await page.render({ canvasContext: context, viewport: viewport }).promise;
+
+                setOcrStatus(`Analyzing page ${i}/${pdf.numPages} with OCR...`);
+                const { data: { text } } = await window.Tesseract.recognize(
+                    canvas,
+                    'chi_tra', // Traditional Chinese
+                    { 
+                        logger: m => {
+                            if (m.status === 'recognizing text') {
+                                setOcrStatus(`OCR on page ${i}: ${Math.round(m.progress * 100)}%`);
+                            }
+                        }
+                    }
+                );
+                fullText += text + '\n\n';
+            }
+            
+            setWorkspace(p => ({
+                ...p,
+                rawText: fullText,
+                metrics: { ...p.metrics, chars: fullText.length, ocr_pages: pdf.numPages }
+            }));
+            setOcrStatus('');
+            setActiveTab('agents');
+        };
+
+        fileReader.readAsArrayBuffer(file);
+    };
+    
+    const handleRawTextChange = (newText) => {
+        const oldText = workspace.rawText;
+        setWorkspace(p => ({
+            ...p,
+            rawText: newText,
+            metrics: { ...p.metrics, chars: newText.length }
+        }));
+
+        // Heuristic: If user pastes a large chunk of text, move to the next step.
+        // Threshold of 200 characters and must be on the ingestion tab.
+        if (activeTab === 'ingestion' && (newText.length - oldText.length) > 200) {
+            setActiveTab('agents');
         }
     };
 
@@ -228,19 +310,16 @@ General rules:
             <div className="ingestion-grid">
                 <div className="card">
                     <h3>Upload Guidance</h3>
-                    <p>Supported formats: TXT, MD. PDF upload is supported for text extraction, but on-device OCR is not available in this web environment.</p>
+                    <p>Supported formats: TXT, MD, and PDF (with Traditional Chinese OCR).</p>
                     <input type="file" onChange={handleFileChange} accept=".txt,.md,.pdf" />
+                    {ocrStatus && <div className="ocr-status">{ocrStatus}</div>}
                 </div>
                 <div className="card">
                     <h3>Paste Guidance</h3>
                     <textarea 
                         aria-label="Paste guidance text here"
                         value={workspace.rawText} 
-                        onChange={e => setWorkspace(p => ({
-                            ...p, 
-                            rawText: e.target.value,
-                            metrics: {...p.metrics, chars: e.target.value.length}
-                        }))}
+                        onChange={e => handleRawTextChange(e.target.value)}
                         placeholder="Paste guidance text here..."
                     />
                 </div>
@@ -285,14 +364,15 @@ General rules:
                                     onChange={e => handleRunConfigChange(index, 'params.temperature', parseFloat(e.target.value))}
                                 />
                             </div>
+                             {/* FIX: Changed `max_output_tokens` to `maxOutputTokens` to match updated state property. */}
                              <div className="form-group">
                                 <label htmlFor={`tokens-${index}`}>Max Tokens</label>
                                 <input 
                                     type="number"
                                     id={`tokens-${index}`} 
                                     min="256" max="8192" step="64"
-                                    value={agent.params.max_output_tokens}
-                                    onChange={e => handleRunConfigChange(index, 'params.max_output_tokens', parseInt(e.target.value))}
+                                    value={agent.params.maxOutputTokens}
+                                    onChange={e => handleRunConfigChange(index, 'params.maxOutputTokens', parseInt(e.target.value))}
                                 />
                             </div>
                         </div>
@@ -388,6 +468,10 @@ General rules:
                 <div className="card metric-card">
                     <h4>Chars Ingested</h4>
                     <p>{m.chars.toLocaleString()}</p>
+                </div>
+                 <div className="card metric-card">
+                    <h4>PDF Pages OCR'd</h4>
+                    <p>{m.ocr_pages.toLocaleString()}</p>
                 </div>
                 <div className="card metric-card">
                     <h4>Agents Run</h4>
@@ -548,6 +632,12 @@ const STYLES = `
     .button-secondary:hover { background-color: var(--primary-color); color: white; }
 
     .ingestion-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 1.5rem; }
+    .ocr-status {
+        margin-top: 1rem;
+        font-weight: 500;
+        color: var(--primary-color);
+    }
+
 
     .agent-card {
         border: 1px solid var(--border-color);
